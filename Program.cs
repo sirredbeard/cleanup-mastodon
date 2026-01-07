@@ -10,7 +10,8 @@ string? username = null;
 string? apiToken = null;
 DateTime cutoffDate = DateTime.MinValue;
 bool debug = false;
-bool noRateLimit = false;
+int rateLimitLevel = 2; // 0: no wait, 1: 5-10s, 2: 20-30s, 3: 30-60s
+bool longWait = false;
 
 // Parse args: --instance, --username, --token, --date, --debug, --verbose
 for (int i = 0; i < args.Length; i++)
@@ -34,9 +35,19 @@ for (int i = 0; i < args.Length; i++)
 		case "--verbose":
 			debug = true;
 			break;
-        case "--no-rate-limit":
-            noRateLimit = true;
+		case "--no-rate-limit":
+			rateLimitLevel = 0;
+			break;
+        case "--long-wait":
+            longWait = true;
             break;
+		case "--rate-limit-level":
+			if (i + 1 < args.Length && int.TryParse(args[i + 1], out int lvl) && lvl >= 0 && lvl <= 3)
+			{
+				rateLimitLevel = lvl;
+				i++;
+			}
+			break;
 	}
 }
 
@@ -171,17 +182,60 @@ while (more)
 				Console.WriteLine($"Failed to delete post {id}: {delResp.StatusCode}");
 				if (delResp.StatusCode.ToString() == "TooManyRequests")
 				{
-					Console.WriteLine("Received TooManyRequests error. Stopping execution to avoid further rate limiting.");
-					return;
+					if (longWait)
+					{
+						// Wait until next :00 or :30
+						var now = DateTime.Now;
+						int minutesToNextHalfHour = (now.Minute < 30) ? (30 - now.Minute) : (60 - now.Minute);
+						int secondsToNextHalfHour = (minutesToNextHalfHour * 60) - now.Second;
+						var target = now.AddSeconds(secondsToNextHalfHour);
+						Console.WriteLine($"Rate limit hit. Waiting until {target:HH:mm} to retry...");
+						await Task.Delay(secondsToNextHalfHour * 1000);
+						Console.WriteLine("Retrying delete...");
+						delResp = await client.DeleteAsync($"/api/v1/statuses/{id}");
+						if (delResp.IsSuccessStatusCode)
+						{
+							deleted++;
+							if (debug)
+								Console.WriteLine($"Deleted post {id} from {createdAt:u} ({uri}) after long wait");
+						}
+						else if (delResp.StatusCode.ToString() == "TooManyRequests")
+						{
+							Console.WriteLine("Still rate limited after long wait. Stopping execution.");
+							return;
+						}
+						else
+						{
+							Console.WriteLine($"Failed to delete post {id} after long wait: {delResp.StatusCode}");
+						}
+					}
+					else
+					{
+						Console.WriteLine("Received TooManyRequests error. Stopping execution to avoid further rate limiting.");
+						return;
+					}
 				}
 			}
-			if (!noRateLimit)
+			if (rateLimitLevel > 0)
 			{
-				// Wait 10-20 seconds to avoid rate limit
+				int minDelay, maxDelay;
+				switch (rateLimitLevel)
+				{
+					case 1:
+						minDelay = 5000; maxDelay = 10001; // 5-10s
+						break;
+					case 3:
+						minDelay = 30000; maxDelay = 60001; // 30-60s
+						break;
+					case 2:
+					default:
+						minDelay = 20000; maxDelay = 30001; // 20-30s
+						break;
+				}
 				var rand = new Random();
-				int delay = rand.Next(10000, 20001); // ms
+				int delay = rand.Next(minDelay, maxDelay); // ms
 				if (debug)
-					Console.WriteLine($"Waiting {delay / 1000.0:F1} seconds to avoid rate limit...");
+					Console.WriteLine($"Waiting {delay / 1000.0:F1} seconds to avoid rate limit (level {rateLimitLevel})...");
 				await Task.Delay(delay);
 			}
 		}
